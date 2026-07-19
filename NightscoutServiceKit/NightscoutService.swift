@@ -63,6 +63,8 @@ public final class NightscoutService: Service {
     
     private let commandSourceV1: RemoteCommandSourceV1
 
+    private let activityAggregator = NightscoutActivityAggregator()
+
     private let log = OSLog(category: "NightscoutService")
 
     public init() {
@@ -292,23 +294,26 @@ extension NightscoutService: RemoteDataService {
             }
         }
 
-        let statuses = uploadPairs.map { (decision, automaticDoseDecision) in
-            return decision.deviceStatus(automaticDoseDecision: automaticDoseDecision)
-        }
-
-        guard statuses.count > 0 else {
+        guard uploadPairs.count > 0 else {
             completion(.success(false))
             return
         }
 
-        uploader.uploadDeviceStatuses(statuses) { result in
-            switch result {
-            case .success:
-                self.lastDosingDecisionForAutomaticDose = nil
-            default:
-                break
+        activityAggregator.activityStatuses(endingAt: uploadPairs.map { $0.0.date }) { activityStatuses in
+            let statuses = zip(uploadPairs, activityStatuses).map { (pair, activityStatus) in
+                let (decision, automaticDoseDecision) = pair
+                return decision.deviceStatus(automaticDoseDecision: automaticDoseDecision, activity: activityStatus)
             }
-            completion(result)
+
+            uploader.uploadDeviceStatuses(statuses) { result in
+                switch result {
+                case .success:
+                    self.lastDosingDecisionForAutomaticDose = nil
+                default:
+                    break
+                }
+                completion(result)
+            }
         }
     }
 
@@ -517,6 +522,189 @@ extension NightscoutService: RemoteCommandSourceV1Delegate {
                 }
             })
         }
+    }
+}
+
+private final class NightscoutActivityAggregator {
+    private let healthStore: HKHealthStore
+    private let window: TimeInterval
+
+    private let stepsType = HKQuantityType.quantityType(forIdentifier: .stepCount)!
+    private let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate)!
+    private let activeEnergyType = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)!
+    private let exerciseTimeType = HKQuantityType.quantityType(forIdentifier: .appleExerciseTime)!
+    private let distanceType = HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)!
+    private let workoutType = HKObjectType.workoutType()
+
+    private var readTypes: Set<HKObjectType> {
+        return [stepsType, heartRateType, activeEnergyType, exerciseTimeType, distanceType, workoutType]
+    }
+
+    init(healthStore: HKHealthStore = HKHealthStore(), window: TimeInterval = .minutes(5)) {
+        self.healthStore = healthStore
+        self.window = window
+    }
+
+    func activityStatuses(endingAt endDates: [Date], completion: @escaping ([ActivityStatus?]) -> Void) {
+        guard HKHealthStore.isHealthDataAvailable(), !endDates.isEmpty else {
+            completion(Array(repeating: nil, count: endDates.count))
+            return
+        }
+
+        authorizeIfNeeded { authorized in
+            guard authorized else {
+                completion(Array(repeating: nil, count: endDates.count))
+                return
+            }
+
+            var statuses = Array<ActivityStatus?>(repeating: nil, count: endDates.count)
+            let group = DispatchGroup()
+
+            for (index, endDate) in endDates.enumerated() {
+                group.enter()
+                self.activityStatus(endingAt: endDate) { status in
+                    statuses[index] = status
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .global()) {
+                completion(statuses)
+            }
+        }
+    }
+
+    private func authorizeIfNeeded(completion: @escaping (Bool) -> Void) {
+        healthStore.getRequestStatusForAuthorization(toShare: Set<HKSampleType>(), read: readTypes) { status, _ in
+            switch status {
+            case .shouldRequest:
+                self.healthStore.requestAuthorization(toShare: Set<HKSampleType>(), read: self.readTypes) { success, _ in
+                    completion(success)
+                }
+            case .unnecessary:
+                completion(true)
+            case .unknown:
+                completion(true)
+            @unknown default:
+                completion(true)
+            }
+        }
+    }
+
+    private func activityStatus(endingAt endDate: Date, completion: @escaping (ActivityStatus?) -> Void) {
+        let startDate = endDate.addingTimeInterval(-window)
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictEndDate)
+        let group = DispatchGroup()
+
+        var steps: Double?
+        var heartRateAvg: Double?
+        var heartRateMax: Double?
+        var activeEnergyKcal: Double?
+        var exerciseMinutes: Double?
+        var distanceMeters: Double?
+        var workoutActive: Bool?
+
+        group.enter()
+        cumulativeSum(for: stepsType, unit: .count(), predicate: predicate) { value in
+            steps = value
+            group.leave()
+        }
+
+        group.enter()
+        average(for: heartRateType, unit: HKUnit.count().unitDivided(by: .minute()), predicate: predicate) { value in
+            heartRateAvg = value
+            group.leave()
+        }
+
+        group.enter()
+        maximum(for: heartRateType, unit: HKUnit.count().unitDivided(by: .minute()), predicate: predicate) { value in
+            heartRateMax = value
+            group.leave()
+        }
+
+        group.enter()
+        cumulativeSum(for: activeEnergyType, unit: .kilocalorie(), predicate: predicate) { value in
+            activeEnergyKcal = value
+            group.leave()
+        }
+
+        group.enter()
+        cumulativeSum(for: exerciseTimeType, unit: .minute(), predicate: predicate) { value in
+            exerciseMinutes = value
+            group.leave()
+        }
+
+        group.enter()
+        cumulativeSum(for: distanceType, unit: .meter(), predicate: predicate) { value in
+            distanceMeters = value
+            group.leave()
+        }
+
+        group.enter()
+        hasActiveWorkout(startDate: startDate, endDate: endDate) { value in
+            workoutActive = value
+            group.leave()
+        }
+
+        group.notify(queue: .global()) {
+            if steps == nil,
+               heartRateAvg == nil,
+               heartRateMax == nil,
+               activeEnergyKcal == nil,
+               exerciseMinutes == nil,
+               distanceMeters == nil,
+               workoutActive != true
+            {
+                completion(nil)
+                return
+            }
+
+            completion(ActivityStatus(
+                windowMinutes: self.window.minutes,
+                steps: steps,
+                heartRateAvg: heartRateAvg,
+                heartRateMax: heartRateMax,
+                activeEnergyKcal: activeEnergyKcal,
+                exerciseMinutes: exerciseMinutes,
+                distanceMeters: distanceMeters,
+                workoutActive: workoutActive
+            ))
+        }
+    }
+
+    private func cumulativeSum(for quantityType: HKQuantityType, unit: HKUnit, predicate: NSPredicate, completion: @escaping (Double?) -> Void) {
+        let query = HKStatisticsQuery(quantityType: quantityType, quantitySamplePredicate: predicate, options: .cumulativeSum) { _, statistics, _ in
+            completion(statistics?.sumQuantity()?.doubleValue(for: unit))
+        }
+        healthStore.execute(query)
+    }
+
+    private func average(for quantityType: HKQuantityType, unit: HKUnit, predicate: NSPredicate, completion: @escaping (Double?) -> Void) {
+        let query = HKStatisticsQuery(quantityType: quantityType, quantitySamplePredicate: predicate, options: .discreteAverage) { _, statistics, _ in
+            completion(statistics?.averageQuantity()?.doubleValue(for: unit))
+        }
+        healthStore.execute(query)
+    }
+
+    private func maximum(for quantityType: HKQuantityType, unit: HKUnit, predicate: NSPredicate, completion: @escaping (Double?) -> Void) {
+        let query = HKStatisticsQuery(quantityType: quantityType, quantitySamplePredicate: predicate, options: .discreteMax) { _, statistics, _ in
+            completion(statistics?.maximumQuantity()?.doubleValue(for: unit))
+        }
+        healthStore.execute(query)
+    }
+
+    private func hasActiveWorkout(startDate: Date, endDate: Date, completion: @escaping (Bool?) -> Void) {
+        let startsBeforeWindowEnds = NSPredicate(format: "%K < %@", HKPredicateKeyPathStartDate, endDate as NSDate)
+        let endsAfterWindowStarts = NSPredicate(format: "%K > %@", HKPredicateKeyPathEndDate, startDate as NSDate)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [startsBeforeWindowEnds, endsAfterWindowStarts])
+        let query = HKSampleQuery(sampleType: workoutType, predicate: predicate, limit: 1, sortDescriptors: nil) { _, samples, error in
+            guard error == nil else {
+                completion(nil)
+                return
+            }
+            completion(samples?.isEmpty == false)
+        }
+        healthStore.execute(query)
     }
 }
 
