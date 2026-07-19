@@ -1321,9 +1321,9 @@
 		};
 		C1CEBFF229BCC104007FD8A3 /* XCRemoteSwiftPackageReference "NightscoutKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/LoopKit/NightscoutKit";
+			repositoryURL = "https://github.com/andrewtcombs/NightscoutKit";
 			requirement = {
-				branch = main;
+				branch = "feature/nightscout-activity-v1";
 				kind = branch;
 			};
 		};

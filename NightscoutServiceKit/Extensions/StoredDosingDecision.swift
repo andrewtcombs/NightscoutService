@@ -33,6 +33,11 @@ extension StoredDosingDecision {
         }
         return PredictedBG(startDate: startDate, values: predictedGlucose.map { $0.quantity })
     }
+
+    var loopStatusActivity: ActivityStatus? {
+        // V1 model wiring only. Real HealthKit aggregation is intentionally added in a later patch.
+        return nil
+    }
     
     var loopStatusAutomaticDoseRecommendation: NightscoutKit.AutomaticDoseRecommendation? {
         guard let automaticDoseRecommendation = automaticDoseRecommendation else {
@@ -156,7 +161,8 @@ extension StoredDosingDecision {
                                    automaticDoseRecommendation: loopStatusAutomaticDoseRecommendation,
                                    recommendedBolus: loopStatusRecommendedBolus,
                                    enacted: automaticDoseDecision?.loopStatusEnacted,
-                                   failureReason: automaticDoseDecision?.loopStatusFailureReason),
+                                   failureReason: automaticDoseDecision?.loopStatusFailureReason,
+                                   activity: loopStatusActivity),
             overrideStatus: overrideStatus)
     }
     
