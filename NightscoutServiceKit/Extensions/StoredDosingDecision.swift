@@ -59,6 +59,51 @@ extension StoredDosingDecision {
         }
         return manualBolusRecommendation.recommendation.amount
     }
+
+    var loopStatusTherapySettings: TherapySettingsStatus? {
+        guard let glucoseTargetRange = glucoseTargetRangeSchedule?.value(at: date) else {
+            return nil
+        }
+
+        let unit = glucoseTargetRangeSchedule?.unit ?? HKUnit.milligramsPerDeciliter
+        let lowerTarget = HKQuantity(unit: unit, doubleValue: glucoseTargetRange.minValue)
+        let upperTarget = HKQuantity(unit: unit, doubleValue: glucoseTargetRange.maxValue)
+        let effectiveTargetRange = CorrectionRange(minValue: lowerTarget, maxValue: upperTarget)
+
+        let activeOverride: ActiveOverrideStatus?
+        if let scheduleOverride = scheduleOverride, scheduleOverride.isActive(at: date) {
+            activeOverride = ActiveOverrideStatus(
+                name: scheduleOverride.nightscoutTelemetryName,
+                context: scheduleOverride.nightscoutTelemetryContext,
+                startDate: scheduleOverride.startDate,
+                endDate: scheduleOverride.duration != .indefinite ? scheduleOverride.actualEndDate : nil,
+                duration: scheduleOverride.duration != .indefinite ? scheduleOverride.actualEndDate.timeIntervalSince(date) : nil,
+                targetRange: scheduleOverride.settings.targetRange.map { CorrectionRange(minValue: $0.lowerBound, maxValue: $0.upperBound) },
+                insulinNeedsScaleFactor: scheduleOverride.settings.insulinNeedsScaleFactor
+            )
+        } else {
+            activeOverride = nil
+        }
+
+        return TherapySettingsStatus(effectiveTargetRange: effectiveTargetRange, activeOverride: activeOverride)
+    }
+
+    var loopStatusController: NightscoutKit.ControllerStatus? {
+        return settings?.dosingEnabled.map { NightscoutKit.ControllerStatus(closedLoop: $0) }
+    }
+
+    var loopStatusPumpDelivery: PumpDeliveryStatus? {
+        guard let pumpManagerStatus = pumpManagerStatus else {
+            return nil
+        }
+
+        return PumpDeliveryStatus(
+            basalState: pumpManagerStatus.basalDeliveryState?.nightscoutTelemetryStatus,
+            suspended: pumpManagerStatus.basalDeliveryState?.isSuspended,
+            bolusing: pumpStatusBolusing,
+            deliveryIsUncertain: pumpManagerStatus.deliveryIsUncertain
+        )
+    }
     
     var loopStatusEnacted: LoopEnacted? {
         guard let automaticDoseRecommendation = automaticDoseRecommendation, errors.isEmpty else {
@@ -157,10 +202,62 @@ extension StoredDosingDecision {
                                    recommendedBolus: loopStatusRecommendedBolus,
                                    enacted: automaticDoseDecision?.loopStatusEnacted,
                                    failureReason: automaticDoseDecision?.loopStatusFailureReason,
-                                   activity: activity),
+                                   activity: activity,
+                                   therapySettings: loopStatusTherapySettings,
+                                   controller: loopStatusController,
+                                   pumpDelivery: loopStatusPumpDelivery),
             overrideStatus: overrideStatus)
     }
     
+}
+
+private extension TemporaryScheduleOverride {
+    var nightscoutTelemetryContext: String {
+        switch context {
+        case .preMeal:
+            return "preMeal"
+        case .legacyWorkout:
+            return "legacyWorkout"
+        case .preset:
+            return "preset"
+        case .custom:
+            return "custom"
+        }
+    }
+
+    var nightscoutTelemetryName: String {
+        switch context {
+        case .preMeal:
+            return "Pre-Meal"
+        case .legacyWorkout:
+            return "Workout"
+        case .preset(let preset):
+            return preset.name
+        case .custom:
+            return "Custom"
+        }
+    }
+}
+
+private extension PumpManagerStatus.BasalDeliveryState {
+    var nightscoutTelemetryStatus: BasalDeliveryStateStatus {
+        switch self {
+        case .active(let at):
+            return BasalDeliveryStateStatus(kind: "activeScheduled", startedAt: at)
+        case .initiatingTempBasal:
+            return BasalDeliveryStateStatus(kind: "initiatingTempBasal")
+        case .tempBasal(let dose):
+            return BasalDeliveryStateStatus(kind: "tempBasal", startedAt: dose.startDate, rate: dose.unitsPerHour, duration: dose.endDate.timeIntervalSince(dose.startDate))
+        case .cancelingTempBasal:
+            return BasalDeliveryStateStatus(kind: "cancelingTempBasal")
+        case .suspending:
+            return BasalDeliveryStateStatus(kind: "suspending")
+        case .suspended(let at):
+            return BasalDeliveryStateStatus(kind: "suspended", startedAt: at)
+        case .resuming:
+            return BasalDeliveryStateStatus(kind: "resuming")
+        }
+    }
 }
 
 extension StoredDosingDecision.Issue {
