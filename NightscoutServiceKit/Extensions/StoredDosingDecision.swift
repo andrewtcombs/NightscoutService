@@ -211,7 +211,7 @@ extension StoredDosingDecision {
     
 }
 
-private extension TemporaryScheduleOverride {
+private extension LoopKit.TemporaryScheduleOverride {
     var nightscoutTelemetryContext: String {
         switch context {
         case .preMeal:
